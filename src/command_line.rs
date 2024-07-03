@@ -7,13 +7,7 @@ use std::path::PathBuf;
 pub struct CommandLineArgs {
     /// The path to the configuration file to use.
     #[clap(short, long)]
-    pub config: PathBuf,
-    /// The OpenRPC document to be parsed.
-    #[clap(short, long)]
-    pub document: PathBuf,
-    /// The path to the output file.
-    #[clap(short, long)]
-    pub output: PathBuf,
+    pub directory: PathBuf,
 }
 
 /// Loads an instance of [`CommandLineArgs`] from the environment.

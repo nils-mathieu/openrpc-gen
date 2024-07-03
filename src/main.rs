@@ -1,69 +1,82 @@
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
+use std::path::PathBuf;
 
 mod command_line;
 mod config;
+mod deps;
 mod fix;
 mod gen;
 mod parse;
 
-fn main() -> ExitCode {
-    let cmd = command_line::from_env();
-    let config = match config::load(&cmd.config) {
-        Ok(config) => config,
-        Err(err) => {
-            let _ = print_error(format_args!("`{}`: {}", cmd.config.display(), err));
-            return ExitCode::FAILURE;
-        }
-    };
-    let document = match load_document(&cmd.document) {
-        Ok(document) => document,
-        Err(err) => {
-            let _ = print_error(format_args!("`{}`: {}", cmd.document.display(), err));
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut document = match parse::parse(&document) {
-        Ok(document) => document,
-        Err(errs) => {
-            for err in errs {
-                let _ = print_error(format_args!("`{}`: {}", err.path, err.message));
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-    match fix::fix(&mut document, &config) {
-        Ok(_) => {}
-        Err(errs) => {
-            for err in errs {
-                let _ = print_error(format_args!("{}", err));
-            }
-            return ExitCode::FAILURE;
-        }
-    }
-    let mut output = match std::fs::File::create(&cmd.output) {
-        Ok(output) => std::io::BufWriter::new(output),
-        Err(err) => {
-            let _ = print_error(format_args!("`{}`: {}", cmd.output.display(), err));
-            return ExitCode::FAILURE;
-        }
-    };
-    match gen::gen(&mut output, &document, &config) {
-        Ok(_) => {}
-        Err(err) => {
-            let _ = print_error(format_args!("{}", err));
-            return ExitCode::FAILURE;
-        }
-    }
-    drop(output);
-    if config.run_rustfmt {
-        if let Err(err) = run_rustmft(&cmd.output) {
-            let _ = print_error(format_args!("{}", err));
-            return ExitCode::FAILURE;
-        }
-    }
-    ExitCode::SUCCESS
+use config::Config;
+use deps::TypeDeps;
+use parse::File;
+
+fn main() -> Result<(), String> {
+    // let cmd = command_line::from_env();
+
+    let rpc_config = load_config(PathBuf::from("./starknet_api_openrpc.toml"))?;
+    let rpc_document =
+        load_and_fix_document(PathBuf::from("./starknet_api_openrpc.json"), &rpc_config)?;
+
+    let trace_config = load_config(PathBuf::from("./starknet_trace_api_openrpc.toml"))?;
+    let trace_document = load_and_fix_document(
+        PathBuf::from("./starknet_trace_api_openrpc.json"),
+        &trace_config,
+    )?;
+
+    let write_config = load_config(PathBuf::from("./starknet_write_api.toml"))?;
+    let write_document =
+        load_and_fix_document(PathBuf::from("./starknet_write_api.json"), &write_config)?;
+
+    let mut deps = TypeDeps::new();
+
+    deps.add(&rpc_config, &rpc_document);
+    deps.add(&trace_config, &trace_document);
+    deps.add(&write_config, &write_document);
+
+    deps.add_edge(String::from("BlockId"), String::from("F"));
+
+    deps.add_edge(String::from("BroadcastedInvokeTxn"), String::from("F"));
+    deps.add_edge(
+        String::from("BroadcastedInvokeTxn"),
+        String::from("F_ImplicitDefault"),
+    );
+
+    deps.add_edge(String::from("BroadcastedDeclareTxn"), String::from("F"));
+    deps.add_edge(
+        String::from("BroadcastedDeclareTxn"),
+        String::from("F_ImplicitDefault"),
+    );
+
+    deps.add_edge(
+        String::from("BroadcastedDeployAccountTxn"),
+        String::from("F"),
+    );
+
+    deps.fix_defaults();
+
+    generate(
+        &rpc_document,
+        &rpc_config,
+        &deps,
+        PathBuf::from("./starknet_api_openrpc.rs"),
+    )?;
+    generate(
+        &trace_document,
+        &trace_config,
+        &deps,
+        PathBuf::from("./starknet_trace_api_openrpc.rs"),
+    )?;
+    generate(
+        &write_document,
+        &write_config,
+        &deps,
+        PathBuf::from("./starknet_write_api.rs"),
+    )?;
+
+    Ok(())
 }
 
 /// Print an error message to the standard error stream.
@@ -79,12 +92,52 @@ fn print_error(args: std::fmt::Arguments) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Loads the document from the provided path.
+fn load_config(cmd_config: PathBuf) -> Result<Config, String> {
+    config::load(&cmd_config).map_err(|err| format!("`{}`: {}", cmd_config.display(), err))
+}
+
 fn load_document(path: &Path) -> Result<open_rpc::OpenRpc, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let buf = std::io::BufReader::new(file);
     let document = serde_json::from_reader(buf).map_err(|e| e.to_string())?;
     Ok(document)
+}
+
+fn load_and_fix_document(cmd_document: PathBuf, config: &Config) -> Result<File, String> {
+    let document = load_document(&cmd_document)
+        .map_err(|err| format!("`{}`: {}", cmd_document.display(), err))?;
+
+    let mut document = parse::parse(&document).map_err(|errs| {
+        errs.iter()
+            .map(|err| format!("`{}`: {}", err.path, err.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+
+    fix::fix(&mut document, &config).map_err(|errs| errs.join("\n"))?;
+
+    Ok(document)
+}
+
+fn generate(
+    document: &File,
+    config: &Config,
+    deps: &TypeDeps,
+    cmd_output: PathBuf,
+) -> Result<(), String> {
+    let mut output = std::fs::File::create(&cmd_output)
+        .map_err(|err| format!("`{}`: {}", cmd_output.display(), err))?;
+
+    gen::gen(&mut output, document, config, deps).map_err(|err| format!("{}", err))?;
+
+    drop(output);
+
+    if config.run_rustfmt {
+        if let Err(err) = run_rustmft(&cmd_output) {
+            return Err(format!("{}", err));
+        }
+    }
+    Ok(())
 }
 
 /// Runs `rustfmt` on the provided path.
